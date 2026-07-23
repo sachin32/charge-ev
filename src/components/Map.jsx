@@ -19,6 +19,16 @@ const reducer = (state, action) => ({
   ...action,
 });
 
+// Basic HTML-escaping so charger data can't inject markup into the popup
+const escapeHtml = (value) =>
+  String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[ch]));
+
 export default function Map({ location, chargers = [], routeGeoJSON = null }) {
   const mapContainer = useRef(null);
   const map = useRef(null);
@@ -43,51 +53,64 @@ export default function Map({ location, chargers = [], routeGeoJSON = null }) {
     return "Car";
   };
 
+  // Initialize the map exactly once, and tear it down on unmount.
   useEffect(() => {
-    if (map.current) return; // stops map from intializing more than once
+    if (map.current) return; // stops map from initializing more than once
 
     map.current = new maptilersdk.Map({
       container: mapContainer.current,
       style: "streets-v4",
-      center: [center.lng, center.lat],
-      zoom,
+      center: [initialState.center.lng, initialState.center.lat],
+      zoom: initialState.zoom,
       geolocate: true,
     });
 
-    map.current.on("boxzoomend", (e) => {
-      console.log("Box zoom end event:", e);
+    const handleBoxZoom = (e) => {
       const bounds = e.boxZoomBounds;
       const sw = bounds.getSouthWest();
       const ne = bounds.getNorthEast();
       const newCenter = { lng: (sw.lng + ne.lng) / 2, lat: (sw.lat + ne.lat) / 2 };
       const newZoom = map.current.getZoom();
-      console.log("New center:", newCenter, "New zoom:", newZoom);
-    });
+      dispatch({ center: newCenter, zoom: newZoom });
+    };
 
-  }, [center.lng, center.lat, zoom]);
+    map.current.on("boxzoomend", handleBoxZoom);
+
+    return () => {
+      map.current?.off("boxzoomend", handleBoxZoom);
+      map.current?.remove();
+      map.current = null;
+    };
+    // Runs once on mount/unmount only — center/zoom here are just the
+    // initial values, not a dependency to re-init the map on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    if (location) {
-      dispatch({ zoom: 13, center: { lng: location.longitude, lat: location.latitude } });
-      map.current.flyTo({ center: [location.longitude, location.latitude], zoom: 13 });
-    }
+    if (!location || !map.current) return;
+    dispatch({ zoom: 13, center: { lng: location.longitude, lat: location.latitude } });
+    map.current.flyTo({ center: [location.longitude, location.latitude], zoom: 13 });
   }, [location]);
 
   useEffect(() => {
     if (!map.current) return;
 
+    const cleanupMarkers = (markers) => {
+      markers?.forEach((m) => {
+        try {
+          m.marker?.remove?.();
+        } catch (e) {}
+        try {
+          m.popup?.remove?.();
+        } catch (e) {}
+        try {
+          m.root?.unmount?.();
+        } catch (e) {}
+      });
+    };
+
     // remove existing markers, popups, and unmount any rendered React roots
-    state.markers?.forEach((m) => {
-      try {
-        m.marker?.remove?.();
-      } catch (e) {}
-      try {
-        m.popup?.remove?.();
-      } catch (e) {}
-      try {
-        m.root?.unmount?.();
-      } catch (e) {}
-    });
+    cleanupMarkers(state.markers);
 
     const markerObjects = (chargers || [])
       .filter((charger) => charger.AddressInfo?.Latitude && charger.AddressInfo?.Longitude)
@@ -100,11 +123,11 @@ export default function Map({ location, chargers = [], routeGeoJSON = null }) {
 
           const popup = new maptilersdk.Popup({ offset: 16, closeButton: true, closeOnClick: false });
           const info = charger.AddressInfo || {};
-          const title = info.Title || "EV charger";
-          const address = [info.AddressLine1, info.Town, info.StateOrProvince]
-            .filter(Boolean)
-            .join(", ");
-          const vehicleLabel = getVehicleTypeLabel(charger);
+          const title = escapeHtml(info.Title || "EV charger");
+          const address = escapeHtml(
+            [info.AddressLine1, info.Town, info.StateOrProvince].filter(Boolean).join(", ")
+          );
+          const vehicleLabel = escapeHtml(getVehicleTypeLabel(charger));
           const navigateUrl = `https://www.google.com/maps/dir/?api=1&destination=${info.Latitude},${info.Longitude}`;
           const popupHtml = `
             <div style="max-width:220px;font-family:Arial,sans-serif;color:#111">
@@ -121,12 +144,13 @@ export default function Map({ location, chargers = [], routeGeoJSON = null }) {
             .setLngLat([charger.AddressInfo.Longitude, charger.AddressInfo.Latitude])
             .addTo(map.current);
 
-          marker.getElement().addEventListener("click", () => {
+          const handleClick = () => {
             popup.setLngLat([charger.AddressInfo.Longitude, charger.AddressInfo.Latitude]);
             popup.addTo(map.current);
-          });
+          };
+          marker.getElement().addEventListener("click", handleClick);
 
-          return { marker, root, popup };
+          return { marker, root, popup, handleClick, el };
         } catch (err) {
           // fallback to default marker
           const marker = new maptilersdk.Marker()
@@ -137,6 +161,10 @@ export default function Map({ location, chargers = [], routeGeoJSON = null }) {
       });
 
     dispatch({ markers: markerObjects });
+
+    // Clean up this batch of markers if chargers change again or on unmount
+    return () => cleanupMarkers(markerObjects);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chargers]);
 
   useEffect(() => {
@@ -162,17 +190,18 @@ export default function Map({ location, chargers = [], routeGeoJSON = null }) {
         });
 
         // fit to route bounds
-        const coords = routeGeoJSON.geometry.coordinates;
-        const lons = coords.map((c) => c[0]);
-        const lats = coords.map((c) => c[1]);
-        const sw = [Math.min(...lons), Math.min(...lats)];
-        const ne = [Math.max(...lons), Math.max(...lats)];
-        if (map.current.fitBounds) {
-          map.current.fitBounds([sw, ne], { padding: 60 });
+        const coords = routeGeoJSON.geometry?.coordinates;
+        if (Array.isArray(coords) && coords.length > 0) {
+          const lons = coords.map((c) => c[0]);
+          const lats = coords.map((c) => c[1]);
+          const sw = [Math.min(...lons), Math.min(...lats)];
+          const ne = [Math.max(...lons), Math.max(...lats)];
+          if (map.current.fitBounds) {
+            map.current.fitBounds([sw, ne], { padding: 60 });
+          }
         }
       }
     } catch (err) {
-      // ignore layer/source removal errors
       console.warn("Map route render error", err);
     }
   }, [routeGeoJSON]);
